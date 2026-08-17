@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
+import math
 import os
 import re
 from collections import defaultdict
@@ -42,6 +44,137 @@ from .sharded_weight import (
 
 if TYPE_CHECKING:
     from paddle.framework import core
+
+
+_SAFETENSORS_DTYPE_MAPPING = {
+    'U16': 'bfloat16',
+    'U8': 'uint8',
+    'I8': 'int8',
+    'I16': 'int16',
+    'BOOL': 'bool',
+    'F16': 'float16',
+    'F32': 'float32',
+    'F64': 'float64',
+    'BF16': 'bfloat16',
+    'I64': 'int64',
+}
+
+# These formats have one byte per element but do not all have an exact Paddle
+# dtype. FlexCheckpoint transports them losslessly as uint8; a caller-provided
+# LoadTransform owns their numerical interpretation.
+_SAFETENSORS_RAW_8BIT_FORMATS = {
+    'F8_E4M3',
+    'F8_E4M3FN',
+    'F8_E8M0',
+}
+
+
+def get_safetensors_storage_dtype(storage_format: str) -> str:
+    """Return the Paddle dtype used to transport a safetensors value."""
+    if storage_format in _SAFETENSORS_DTYPE_MAPPING:
+        return _SAFETENSORS_DTYPE_MAPPING[storage_format]
+    if storage_format in _SAFETENSORS_RAW_8BIT_FORMATS:
+        return 'uint8'
+    raise ValueError(
+        f"Safetensors dtype {storage_format!r} is not supported. "
+        "Unknown formats are never treated as raw bytes unless their element "
+        "width and transport semantics are explicitly registered."
+    )
+
+
+def _read_safetensors_header(path: str) -> tuple[dict, int]:
+    file_size = os.path.getsize(path)
+    with open(path, 'rb') as stream:
+        raw_header_size = stream.read(8)
+        if len(raw_header_size) != 8:
+            raise ValueError(
+                f"Invalid safetensors file {path!r}: missing header size."
+            )
+        header_size = int.from_bytes(raw_header_size, 'little', signed=False)
+        if header_size <= 0 or header_size > file_size - 8:
+            raise ValueError(
+                f"Invalid safetensors header size {header_size} for {path!r}."
+            )
+        raw_header = stream.read(header_size)
+    try:
+        header = json.loads(raw_header)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid safetensors JSON header in {path!r}."
+        ) from exc
+    if not isinstance(header, dict):
+        raise ValueError(
+            f"Invalid safetensors header in {path!r}: expected an object."
+        )
+    return header, 8 + header_size
+
+
+def load_safetensors_file_preserving_raw(
+    path: str,
+) -> dict[str, paddle.Tensor]:
+    """Load a safetensors shard while preserving registered raw formats.
+
+    Native dtypes use the regular safetensors Paddle reader. Registered
+    one-byte formats are read directly from their declared data offsets and
+    returned as uint8 tensors with the same logical shape.
+    """
+    header, data_start = _read_safetensors_header(path)
+    raw_keys = {
+        key
+        for key, value in header.items()
+        if key != '__metadata__'
+        and isinstance(value, dict)
+        and value.get('dtype') in _SAFETENSORS_RAW_8BIT_FORMATS
+    }
+
+    from safetensors import safe_open as safe_open_for_paddle
+
+    result = {}
+    with (
+        safe_open_for_paddle(path, framework='paddle') as reader,
+        open(path, 'rb') as stream,
+    ):
+        for key, value in header.items():
+            if key == '__metadata__':
+                continue
+            if not isinstance(value, dict):
+                raise ValueError(
+                    f"Invalid safetensors entry for {key!r} in {path!r}."
+                )
+            storage_format = value.get('dtype')
+            get_safetensors_storage_dtype(storage_format)
+            shape = tuple(value.get('shape', ()))
+            offsets = value.get('data_offsets')
+            if (
+                len(offsets or ()) != 2
+                or not all(isinstance(offset, int) for offset in offsets)
+                or offsets[0] < 0
+                or offsets[1] < offsets[0]
+            ):
+                raise ValueError(
+                    f"Invalid data offsets for {key!r} in {path!r}: "
+                    f"{offsets!r}."
+                )
+
+            if key not in raw_keys:
+                result[key] = reader.get_tensor(key)
+                continue
+
+            expected_size = math.prod(shape)
+            actual_size = offsets[1] - offsets[0]
+            if actual_size != expected_size:
+                raise ValueError(
+                    f"Raw 8-bit tensor {key!r} in {path!r} has "
+                    f"{actual_size} bytes, expected {expected_size} for shape "
+                    f"{shape}."
+                )
+            stream.seek(data_start + offsets[0])
+            payload = stream.read(actual_size)
+            if len(payload) != actual_size:
+                raise ValueError(f"Truncated raw tensor {key!r} in {path!r}.")
+            array = np.frombuffer(payload, dtype=np.uint8).copy().reshape(shape)
+            result[key] = paddle.to_tensor(array, place=paddle.CPUPlace())
+    return result
 
 
 def get_coordinator(mesh: np.array | list[list[int]], rank: int):
@@ -598,19 +731,6 @@ def create_hf_ckpt_metadata(
     ckpt_path: str,
     process_group=None,
 ):
-    dtype_mapping = {
-        'U16': 'bfloat16',
-        'U8': 'uint8',
-        'I8': 'int8',
-        'I16': 'int16',
-        'BOOL': 'bool',
-        'F16': 'float16',
-        'F32': 'float32',
-        'F64': 'float64',
-        'BF16': 'bfloat16',
-        'I64': 'int64',
-    }
-
     use_dist = paddle.distributed.get_world_size() > 1
     cur_rank = paddle.distributed.get_rank() if use_dist else 0
 
@@ -668,9 +788,8 @@ def create_hf_ckpt_metadata(
             for key in f.keys():
                 t_s = f.get_slice(key)
                 shape = tuple(t_s.get_shape())
-                dtype = t_s.get_dtype()
-                assert dtype in dtype_mapping, f"{dtype} is not supported yet."
-                dtype = dtype_mapping[dtype]
+                storage_format = t_s.get_dtype()
+                dtype = get_safetensors_storage_dtype(storage_format)
                 ltm = LocalTensorMetadata(
                     global_offset=(0,) * len(shape),
                     local_shape=shape,
